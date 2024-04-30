@@ -11,17 +11,18 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from model import ConformerEncoder, LSTMDecoder
 from utils import *
+from torch.nn import DataParallel
 
 parser = argparse.ArgumentParser("conformer")
-parser.add_argument('--data_dir', type=str, default='./data', help='location to download data')
-parser.add_argument('--checkpoint_path', type=str, default='../model/model_best.pt', help='path to store/load checkpoints')
+parser.add_argument('--data_dir', type=str, default='../Data', help='location to download data')
+parser.add_argument('--checkpoint_path', type=str, default='../model/model_best_parallel.pt', help='path to store/load checkpoints')
 parser.add_argument('--load_checkpoint', action='store_true', default=False, help='resume training from checkpoint')
-parser.add_argument('--train_set', type=str, default='train-clean-100', help='train dataset')
+parser.add_argument('--train_set', type=str, default='train-clean-360', help='train dataset')
 parser.add_argument('--test_set', type=str, default='test-clean', help='test dataset')
-parser.add_argument('--batch_size', type=int, default=32, help='batch size')
+parser.add_argument('--batch_size', type=int, default=64, help='batch size')
 parser.add_argument('--warmup_steps', type=float, default=10000, help='Multiply by sqrt(d_model) to get max_lr')
 parser.add_argument('--peak_lr_ratio', type=int, default=0.05, help='Number of warmup steps for LR scheduler')
-parser.add_argument('--gpu', type=int, default=1, help='gpu device id (optional)')
+parser.add_argument('--gpu', type=int, default=0, help='gpu device id (optional)')
 parser.add_argument('--epochs', type=int, default=200, help='num of training epochs')
 parser.add_argument('--report_freq', type=int, default=100, help='training objective report frequency')
 parser.add_argument('--layers', type=int, default=8, help='total number of layers')
@@ -86,44 +87,34 @@ def main():
 
 
   # Declare Models  
-  
-  encoder = ConformerEncoder(
-                      d_input=args.d_input,
-                      d_model=args.d_encoder,
-                      num_layers=args.encoder_layers,
-                      conv_kernel_size=args.conv_kernel_size, 
-                      dropout=args.dropout,
-                      feed_forward_residual_factor=args.feed_forward_residual_factor,
-                      feed_forward_expansion_factor=args.feed_forward_expansion_factor,
-                      num_heads=args.attention_heads)
-  
-  decoder = LSTMDecoder(
-                  d_encoder=args.d_encoder, 
-                  d_decoder=args.d_decoder, 
-                  num_layers=args.decoder_layers)
   char_decoder = GreedyCharacterDecoder().eval()
   criterion = nn.CTCLoss(blank=28, zero_infinity=True)
+
+  if torch.cuda.is_available():
+      print('Using GPU')
+      gpu = True
+      torch.cuda.set_device(args.gpu)
+      criterion = criterion.cuda()
+      encoder = DataParallel(ConformerEncoder(
+                        d_input=args.d_input,
+                        d_model=args.d_encoder,
+                        num_layers=args.encoder_layers,
+                        conv_kernel_size=args.conv_kernel_size, 
+                        dropout=args.dropout,
+                        feed_forward_residual_factor=args.feed_forward_residual_factor,
+                        feed_forward_expansion_factor=args.feed_forward_expansion_factor,
+                        num_heads=args.attention_heads)).cuda()
+      decoder = DataParallel(LSTMDecoder(
+                    d_encoder=args.d_encoder, 
+                    d_decoder=args.d_decoder, 
+                    num_layers=args.decoder_layers)).cuda()
+      char_decoder = char_decoder.cuda()
+      torch.cuda.empty_cache()
+  else:
+      gpu = False
+
   optimizer = torch.optim.AdamW(list(encoder.parameters()) + list(decoder.parameters()), lr=5e-4, betas=(.9, .98), eps=1e-05 if args.use_amp else 1e-09, weight_decay=args.weight_decay)
   scheduler = TransformerLrScheduler(optimizer, args.d_encoder, args.warmup_steps)
-
-  # Print model size
-  model_size(encoder, 'Encoder')
-  model_size(decoder, 'Decoder')
-
-  gc.collect()
-
-  # GPU Setup
-  if torch.cuda.is_available():
-    print('Using GPU')
-    gpu = True
-    torch.cuda.set_device(args.gpu)
-    criterion = criterion.cuda()
-    encoder = encoder.cuda()
-    decoder = decoder.cuda()
-    char_decoder = char_decoder.cuda()
-    torch.cuda.empty_cache()
-  else:
-    gpu = False
 
   # Mixed Precision Setup
   if args.use_amp:
